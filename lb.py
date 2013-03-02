@@ -1,5 +1,5 @@
 """Link-Backup
-Copyright (c) 2004 Scott Ludwig
+Copyright (c) 2004-2013 Scott Ludwig
 http://www.scottlu.com
 
 Link-Backup is a backup utility that creates hard links between a series
@@ -25,21 +25,6 @@ Source or dest can be remote. Backups are dated with the following entries:
 
 dstdir/YYYY.MM.DD-HH.MM:SS/tree/        backed up file tree
 dstdir/YYYY.MM.DD-HH.MM:SS/log          logfile
-
-Options:
-
-    --verify          Run rsync with --dry-run to cross-verify
-    --numeric-ids     Keep uid/gid values instead of mapping; requires root
-    --minutes <mins>  Only run for <mins> minutes. Incremental backup.
-    --showfiles       Don't backup, only list relative path files needing
-                      backup
-    --catalogonly     Update catalog only
-    --filelist <- or file> Specify filelist. Files relative to srcdir.
-    --lock            Ensure only one backup to a given dest will run at a time
-    --verbose         Show what is happening
-    --ssh-i <file>    Select id file to use for authentication (ssh -i)
-    --ssh-C           Use ssh compression (ssh -C)
-    --ssh-p <port>    ssh port on remote host (ssh -p)
 
 Comments:
 
@@ -116,8 +101,18 @@ and will build the tree.
 Note the source in step 2 could be more perfectly specified as the backup tree
 created underneath the pictures-transfer directory, although it is not necessary
 since only the catalog is being updated (however it would be a speedup).
- 
+
+"""
+"""
 History:
+
+v 0.9 14/01/2013 anouar
+  - add --exclude option to exculde directories from the backup
+  - use argparse for parsing arguments
+  - make some blocks more explicit for people to understand
+  - split the execute function
+  - replace s.st_mtime by int(s.st_mtime) cause the float is causing some odd
+    behavior
 
 v 0.8 12/23/2006 scottlu
   - allow backups to occur while files are changing
@@ -194,6 +189,7 @@ SOFTWARE.
 
 import os
 import sys
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
 import cPickle
 from os.path import join
 import time
@@ -219,6 +215,9 @@ UID = 3
 GID = 4
 CHMOD_BITS = int('6777', 8)
 
+EXCLUDED_DIRS = []
+ARGS = None
+
 def send_object(object):
     global pickler, fd_send
     pickler.dump(object)
@@ -236,7 +235,7 @@ def init_io(send, recv):
     unpickler = cPickle.Unpickler(fd_recv)
 
 def verbose_log(s):
-    if have_option('--verbose'):
+    if have_option('verbose'):
         sys.stderr.write('%s\n' % s)
 
 class Log:
@@ -356,7 +355,6 @@ class Catalog:
 
         # For each file see if exists in the catalog; if not copy it
         # if the md5 exists or download it
-
         datestr = time.strftime(date_format, time.localtime())
         log = Log(join(self.logpath, '%s.log' % datestr), 'wt')
         dl_seconds = 0
@@ -482,7 +480,7 @@ class Catalog:
 
         # Get hashes for new files. If file doesn't exist in old backup with same
         # stat, we need ask the client for a hash
-
+        
         md5requests = []
         for n in xrange(len(filelist)):
             # Only files
@@ -718,11 +716,11 @@ def start_server(src, dst, is_source):
 
     if addr['remote']:
         ssh_args = '%s \"%s\"' % (addr['remote'], cmd1)
-        if have_option('--ssh-p'):
+        if have_option('ssh-p'):
             ssh_args = '-p %s %s' % (get_option_value('--ssh-p'), ssh_args)
-        if have_option('--ssh-i'):
+        if have_option('ssh-i'):
             ssh_args = '-i %s %s' % (get_option_value('--ssh-i'), ssh_args)
-        if have_option('--ssh-C'):
+        if have_option('ssh-C'):
             ssh_args = '-C %s' % ssh_args
         cmd2 = 'ssh %s' % ssh_args
     else:
@@ -753,19 +751,26 @@ def build_filelist_from_tree(treepath):
         def __init__(self, basepath):
             self.lenbase = len('%s%s' % (basepath, os.sep))
 
-        def callback(self, arg, dirpath, filelist):
-            for file in filelist:
+        def callback(self, filelist, dirpath, cur_filelist):            
+            tmp_filelist = [ file for file in cur_filelist]
+            for file in tmp_filelist :
+                filepath = join(dirpath, file)
+                
+                # Exclude directories from the walking process
+                if filepath in EXCLUDED_DIRS :
+                    cur_filelist.remove( file )
+                    continue
+                
                 # Sometimes a stat may fail, like if there are broken
                 # symlinks in the file system
                 try:
                     # Collect stat values instead of stat objects. It's 6
                     # times smaller (measured) and mutuable
-                    # (for uid/gid mapping at the dest)
-                    filepath = join(dirpath, file)
+                    # (for uid/gid mapping at the dest)                    
                     s = os.stat(filepath)
                     if not is_mode_ok(s.st_mode):
                         continue
-                    arg.append((filepath[self.lenbase:], [s.st_mode, s.st_size, s.st_mtime, s.st_uid, s.st_gid]))
+                    filelist.append((filepath[self.lenbase:], [s.st_mode, s.st_size, int(s.st_mtime), s.st_uid, s.st_gid]))
                 except:
                     pass
 
@@ -781,7 +786,7 @@ def build_filelist_from_file(treepath, file):
         s = os.stat(join(treepath, filepath_rel))
         if not is_mode_ok(s.st_mode):
             continue
-        filelist.append((filepath_rel, [s.st_mode, s.st_size, s.st_mtime, s.st_uid, s.st_gid]))
+        filelist.append((filepath_rel, [s.st_mode, s.st_size, int(s.st_mtime), s.st_uid, s.st_gid]))
     return filelist
 
 def build_filelist(treepath):
@@ -825,7 +830,7 @@ def map_uidgid(filelist, idname_map):
     # If root and --numeric-ids specified, keep the numeric
     # ids
 
-    if os.getuid() == 0 and have_option('--numeric-ids'):
+    if os.getuid() == 0 and have_option('numeric-ids'):
         return
 
     # First build a uid->uid map. If not root, valid
@@ -890,14 +895,15 @@ def serve_files(treepath, filelist):
 
     while True:
         # Which file?
-
+        
+        # n is the index of a file in the filelist hash
         n = recv_object()
         if n == -1:
             break
 
         # Calc hash and return it
 
-        verbose_log('src: calc hash for %s' % filelist[n][0])
+        verbose_log('src: sending hash for %s' % filelist[n][0])
         filepath_rel, s = filelist[n]
         filepath_abs = join(treepath, filepath_rel)
         try:
@@ -986,7 +992,7 @@ def is_tree_equal(filelist, treepath_last):
         else:
             s_old = dict_old[key]
             s_new = dict_new[key]
-            different = False
+            #different = False
             if stat.S_ISDIR(s_old[MODE]):
                 if s_old[MODE] != s_new[MODE] or s_old[MTIME] != s_new[MTIME] or s_old[UID] != s_new[UID] or s_old[GID] != s_new[GID]:
                     different = True
@@ -1002,131 +1008,133 @@ def is_tree_equal(filelist, treepath_last):
     verbose_log('no need to build tree - it would be identical to the last tree');
     return True
 
-def execute(src, dst, is_source):
-    if is_source:
-        # Sending side
-        # Create filelist, calc name map, send both
+def run_dest_job(src, dst) :
+    # Receiving side
+    # Recv filelist and name mapping, perform uid/gid mapping
 
-        srcpath = os.path.abspath(os.path.expanduser(src['path']))
-        filelist = build_filelist(srcpath)
-        send_object(filelist)
-        idname_map = build_uidgidmap(filelist)
-        send_object(idname_map)
+    filelist = recv_object()
+    idname_map = recv_object()
+    map_uidgid(filelist, idname_map)
+    manager = Manager(os.path.expanduser(dst['path']))
+    catalog = manager.catalog
+    backups = manager.get_backups()
+    treepath_last = None
+    backup_last = None
+    if len(backups) != 0:
+        backup_last = backups[-1]
+        treepath_last = backup_last.get_treepath()
 
-        # Which command
+    # If --lock specified, only one receiver at a time.
+    # This temp file will get deleted before the script ends,
+    # unless the power cord is pulled. On Linux and Macs, /tmp
+    # gets cleared at boot, so backup will be unlocked. On
+    # Windows, there isn't an equivalent. Also note flock
+    # doesn't work in some filesystems such as nfs.
+    # For these reasons, locking is optional.
 
-        if have_option('--showfiles'):
-            serve_hashes(srcpath, filelist)
-        else:
-            serve_files(srcpath, filelist)
+    if have_option('lock'):
+        lock_file = LockFile('lockfile.lb')
+        if not lock_file.lock():
+            results = 'Attempt to lock failed.'
+            send_object(-1)
+            send_object(results)
+            send_object(None)
+            return results, None
 
-        results = recv_object()
-        subdir = recv_object()
+    # Command?
+
+    if have_option('showfiles'):
+        showfiles = catalog.get_showfiles(filelist, treepath_last)
+        results = '\n'.join([filelist[n][0] for n in showfiles])
+        subdir = None
     else:
-        # Receiving side
-        # Recv filelist and name mapping, perform uid/gid mapping
+        # Calc when the server should stop; used for --minutes control
 
-        filelist = recv_object()
-        idname_map = recv_object()
-        map_uidgid(filelist, idname_map)
-        manager = Manager(os.path.expanduser(dst['path']))
-        catalog = manager.catalog
-        backups = manager.get_backups()
-        treepath_last = None
-        backup_last = None
-        if len(backups) != 0:
-            backup_last = backups[-1]
-            treepath_last = backup_last.get_treepath()
+        end_time = 0
+        for n in xrange(len(sys.argv)):
+            if sys.argv[n] == '--minutes':
+                end_time = int(time.time()) + int(sys.argv[n + 1]) * 60
+                break
 
-        # If --lock specified, only one receiver at a time.
-        # This temp file will get deleted before the script ends,
-        # unless the power cord is pulled. On Linux and Macs, /tmp
-        # gets cleared at boot, so backup will be unlocked. On
-        # Windows, there isn't an equivalent. Also note flock
-        # doesn't work in some filesystems such as nfs.
-        # For these reasons, locking is optional.
+        # Update catalog
 
-        if have_option('--lock'):
-            lock_file = LockFile('lockfile.lb')
-            if not lock_file.lock():
-                results = 'Attempt to lock failed.'
-                send_object(-1)
-                send_object(results)
-                send_object(None)
-                return results, None
-
-        # Command?
-
-        if have_option('--showfiles'):
-            showfiles = catalog.get_showfiles(filelist, treepath_last)
-            results = '\n'.join([filelist[n][0] for n in showfiles])
-            subdir = None
+        complete, transferred, md5hashes = catalog.update(filelist, treepath_last, end_time)
+        if complete:
+            results = 'catalog update complete, %d bytes transferred.' % transferred
         else:
-            # Calc when the server should stop; used for --minutes control
+            results = 'catalog update not complete. %d bytes transferred.' % transferred
 
-            end_time = 0
-            for n in xrange(len(sys.argv)):
-                if sys.argv[n] == '--minutes':
-                    end_time = int(time.time()) + int(sys.argv[n + 1]) * 60
-                    break
+        # Count stats
 
-            # Update catalog
+        #verbose_log('catalog stats:')
+        new = 0
+        copy = 0
+        for entry in catalog.parse_log(catalog.get_logfiles()[-1][1]):
+            if entry[0] == 'copy':
+                copy += 1
+            elif entry[0] == 'new':
+                new += 1
+        results += '\ncatalog: %d new, %d copied.' % (new, copy)
 
-            complete, transferred, md5hashes = catalog.update(filelist, treepath_last, end_time)
-            if complete:
-                results = 'catalog update complete, %d bytes transferred.' % transferred
-            else:
-                results = 'catalog update not complete. %d bytes transferred.' % transferred
+        # Create structure if complete
+        # Don't create if --catalogonly specified
+        # Don't create if new tree would be identical to old tree
 
-            # Count stats
+        subdir = None
+        if complete and not have_option('catalogonly') and not is_tree_equal(filelist, treepath_last):
+            backup_new = manager.new_backup()
+            backup_new.build_tree(backup_last, filelist, md5hashes, catalog)
+            subdir = backup_new.get_treepath()
+            results += '\ntree created: %s' % subdir
 
-            verbose_log('catalog stats:')
+            # 'latest' link
+            latest_link = join(manager.get_path(), 'latest')
+            if os.path.exists(latest_link):
+                os.remove(latest_link)
+            os.symlink(backup_new.get_dirname(), join(manager.get_path(), 'latest'))
+
+            # tree stats
+
             new = 0
             copy = 0
-            for entry in catalog.parse_log(catalog.get_logfiles()[-1][1]):
+            link = 0
+            for entry in backup_new.parse_log():
                 if entry[0] == 'copy':
                     copy += 1
                 elif entry[0] == 'new':
                     new += 1
-            results += '\ncatalog: %d new %d copied.' % (new, copy)
+                elif entry[0] == 'link':
+                    link += 1
+            results += '\ntree: %d new, %d copied, %d linked.' % (new, copy, link)
+        else:
+            results += '\ntree not created.'
 
-            # Create structure if complete
-            # Don't create if --catalogonly specified
-            # Don't create if new tree would be identical to old tree
+    # Send results
 
-            subdir = None
-            if complete and not have_option('--catalogonly') and not is_tree_equal(filelist, treepath_last):
-                backup_new = manager.new_backup()
-                backup_new.build_tree(backup_last, filelist, md5hashes, catalog)
-                subdir = backup_new.get_treepath()
-                results += '\ntree created: %s' % subdir
+    send_object(results)
+    send_object(subdir)
 
-                # 'latest' link
-                latest_link = join(manager.get_path(), 'latest')
-                if os.path.exists(latest_link):
-                    os.remove(latest_link)
-                os.symlink(backup_new.get_dirname(), join(manager.get_path(), 'latest'))
+    return results, subdir
 
-                # tree stats
+def run_src_job(src, dst):
+    # Sending side
+    # Create filelist, calc name map, send both
 
-                new = 0
-                copy = 0
-                link = 0
-                for entry in backup_new.parse_log():
-                    if entry[0] == 'copy':
-                        copy += 1
-                    elif entry[0] == 'new':
-                        new += 1
-                    elif entry[0] == 'link':
-                        link += 1
-                results += '\ntree: %d new %d copied %d linked.' % (new, copy, link)
-            else:
-                results += '\ntree not created.'
+    srcpath = os.path.abspath(os.path.expanduser(src['path']))
+    filelist = build_filelist(srcpath)
+    send_object(filelist)
+    idname_map = build_uidgidmap(filelist)
+    send_object(idname_map)
 
-        # Send results
+    # Which command
 
-        send_object(results)
-        send_object(subdir)
+    if have_option('showfiles'):
+        serve_hashes(srcpath, filelist)
+    else:
+        serve_files(srcpath, filelist)
+
+    results = recv_object()
+    subdir = recv_object()
 
     return results, subdir
 
@@ -1151,16 +1159,12 @@ def parse_address(string):
     return addr
 
 def have_option(option):
-    for s in sys.argv:
-        if s == option:
-            return True
-    return False
+    value = getattr(ARGS, option)
+    return (value != None) and (value != False)
 
 def get_option_value(option):
-    for n in xrange(len(sys.argv)):
-        if sys.argv[n] == option:
-            return sys.argv[n + 1]
-    return None
+    value = getattr(ARGS, option)
+    return value
 
 def error(string):
     sys.stderr.write(string)
@@ -1200,49 +1204,76 @@ class LockFile:
         # Gets called if script is control-c'd
         self.unlock()
 
+
 # Main code
 
 if __name__ == '__main__':
-    # Print help
+    
+    parser = ArgumentParser(formatter_class=RawDescriptionHelpFormatter, description=__doc__)
+    parser.add_argument('src', help='Directory to backup, can be local or remote')
+    parser.add_argument('dst', help='Destination of the backup, can be local or remote')
+    parser.add_argument('--exclude',
+        help='exclude this comma separated directories from backup, ex : dir1,dir2,dirN', 
+        action='store', 
+        dest='excl_dirs')
+    parser.add_argument('--server', help='Execute server side code', action='store_true', default=False)
+    parser.add_argument('--source', help="I'm the source", action='store_true', default=False)
+    parser.add_argument('--verbose', help="Print log to stderr", action='store_true', default=False)
+    parser.add_argument('--verify', help="Run rsync with --dry-run to cross-verify", action='store_true', default=False)
+    parser.add_argument('--numeric-ids', help="Keep uid/gid values instead of mapping; requires root", action='store_true', default=False)
+    parser.add_argument('--showfiles', help="Don't backup, only list relative path files needing backup", action='store_true', default=False)
+    parser.add_argument('--catalogonly', help="Update catalog only", action='store_true', default=False)   
+    parser.add_argument('--lock', help="Ensure only one backup to a given dest will run at a time", action='store_true', default=False)
+    parser.add_argument('--minutes', help="Only run for <min> minutes. Incremental backup")
+    parser.add_argument('--filelist', help="<-> or <file>, Specify filelist. Files relative to srcdir.")
+    parser.add_argument('--ssh-C', help="Use ssh compression (ssh -C)", action='store_true', default=False)
+    parser.add_argument('--ssh-i', help="Select id file to use for authentication (ssh -i)")
+    parser.add_argument('--ssh-p', help="ssh port on remote host (ssh -p)")
+    args = parser.parse_args()
 
-    if len(sys.argv) == 1:
-        print __doc__
-        sys.exit(1)
-
-    if len(sys.argv) < 3:
-        error('Too few parameters.')
+    # Store args in a global variable
+    
+    ARGS = args
 
     # Parse addresses
 
-    src = parse_address(sys.argv[-2:-1][0])
-    dst = parse_address(sys.argv[-1:][0])
+    src = parse_address(ARGS.src)
+    dst = parse_address(ARGS.dst)
+    
+    # Store excluded directories in a global var
+    
+    if ARGS.excl_dirs is not None :
+        EXCLUDED_DIRS = [ s for s in ARGS.excl_dirs.split(',') ]
+    
+    # Only one remote allowed.
+
+    if src['remote'] and dst['remote']:
+        error('Source and Dest cannot both be remote.\n')
 
     # Is this the server?
 
-    if have_option('--server'):
+    if ARGS.server and not ARGS.source :
         init_io(sys.stdout, sys.stdin)
-        execute(src, dst, have_option('--source'))
+        run_dest_job(src, dst)
         sys.exit(0)
 
-    # Client starting. Only one remote allowed.
+    if ARGS.server and ARGS.source :
+        init_io(sys.stdout, sys.stdin)
+        run_src_job(src, dst)
+        sys.exit(0)
 
-    if src['remote'] and dst['remote']:
-        error('Source and Dest cannot both be remote.')
-        
+    # Client starting.
     # The source generates the file list, the dest asks for new files
     # The server can talk through stderr to the console
-
-    if not src['remote']:
-        # Client is source, server is dest
-        
-        start_server(src, dst, False)
-        results, subdir = execute(src, dst, True)
-
+    
+    if src['remote']:
+        # I instruct the server to do the remote source job, I'll take care of the dest job
+        start_server(src, dst, is_source=True)
+        results, subdir = run_dest_job(src, dst)
     else:
-        # Server is source, client is dest
-
-        start_server(src, dst, True)
-        results, subdir = execute(src, dst, False)
+        # I do the src job, I let the server to do the local or remote dest job 
+        start_server(src, dst, is_source=False)
+        results, subdir = run_src_job(src, dst)
 
     # Print results
 
@@ -1257,12 +1288,12 @@ if __name__ == '__main__':
         dstpath = os.path.normpath(join(dst['path'], subdir))
         if (dst['remote']):
             dstpath = dst['remote'] + ':' + dstpath
-        if os.getuid() == 0 and have_option('--numeric-ids'):
+        if os.getuid() == 0 and have_option('numeric-ids'):
             rsync_cmd = 'rsync -av --numeric-ids --dry-run "%s" "%s"' % (srcpath, dstpath)
         else:
             rsync_cmd = 'rsync -av --dry-run "%s" "%s"' % (srcpath, dstpath)
 
-        if have_option('--verify'):
+        if have_option('verify'):
             print rsync_cmd
             sys.stdout.flush()
             os.system(rsync_cmd)
