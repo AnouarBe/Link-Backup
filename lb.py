@@ -371,7 +371,7 @@ class Catalog:
             # If stat equal we don't need a hash for this file
 
             if treepath_last and is_stat_equal(join(treepath_last, filepath_rel), s):
-                verbose_log('dst: found file %s' % filelist[n][0])
+                verbose_log('dst: found same file in latest tree as %s' % filelist[n][0])
                 continue
 
             # Get the md5hash for this file
@@ -386,7 +386,7 @@ class Catalog:
 
             # File already present? Skip.
             if self.file_from_hashstat(md5hashes[n], s):
-                verbose_log('dst: file present already %s' % filelist[n][0])
+                verbose_log('dst: file with same stat and hash present already %s' % filelist[n][0])
                 send_object(False)
                 continue
 
@@ -397,10 +397,11 @@ class Catalog:
                 copyfile_abs = self.file_from_hash(md5hashes[n])
                 if copyfile_abs:
                     # Found same file with different stats. Requires a copy
-                    verbose_log('dst: using file with same hash %s' % filelist[n][0])
+                    verbose_log('dst: using a file %s with same hash as %s' % (copyfile_abs, filelist[n][0]) )
+                    verbose_log('dst: copying to: %s for %s' % (filepath_abs[self.lenbase:], filelist[n][0]))
                     send_object(False)
                     shutil.copyfile(copyfile_abs, tmpfilepath_abs)
-                    log.write('copy from: %s' % filepath_abs[self.lenbase:])
+                    log.write('copy from: %s to %s' % (copyfile_abs, filepath_abs[self.lenbase:]))
                     log.write('copy for: %s' % filepath_rel)
                 else:
                     # Enough time for this file?
@@ -716,11 +717,11 @@ def start_server(src, dst, is_source):
 
     if addr['remote']:
         ssh_args = '%s \"%s\"' % (addr['remote'], cmd1)
-        if have_option('ssh-p'):
+        if have_option('ssh_p'):
             ssh_args = '-p %s %s' % (get_option_value('--ssh-p'), ssh_args)
-        if have_option('ssh-i'):
+        if have_option('ssh_i'):
             ssh_args = '-i %s %s' % (get_option_value('--ssh-i'), ssh_args)
-        if have_option('ssh-C'):
+        if have_option('ssh_C'):
             ssh_args = '-C %s' % ssh_args
         cmd2 = 'ssh %s' % ssh_args
     else:
@@ -749,10 +750,14 @@ def is_mode_ok(mode):
 def build_filelist_from_tree(treepath):
     class ListBuilder:
         def __init__(self, basepath):
-            self.lenbase = len('%s%s' % (basepath, os.sep))
+            if basepath == '/' :
+                self.lenbase = len('%s%s' % (basepath, os.sep)) - 1
+            else :
+                self.lenbase = len('%s%s' % (basepath, os.sep))
 
         def callback(self, filelist, dirpath, cur_filelist):            
             tmp_filelist = [ file for file in cur_filelist]
+            
             for file in tmp_filelist :
                 filepath = join(dirpath, file)
                 
@@ -830,7 +835,7 @@ def map_uidgid(filelist, idname_map):
     # If root and --numeric-ids specified, keep the numeric
     # ids
 
-    if os.getuid() == 0 and have_option('numeric-ids'):
+    if os.getuid() == 0 and have_option('numeric_ids'):
         return
 
     # First build a uid->uid map. If not root, valid
@@ -1159,11 +1164,11 @@ def parse_address(string):
     return addr
 
 def have_option(option):
-    value = getattr(ARGS, option)
+    value = ARGS[option]
     return (value != None) and (value != False)
 
 def get_option_value(option):
-    value = getattr(ARGS, option)
+    value = ARGS[option]
     return value
 
 def error(string):
@@ -1233,17 +1238,17 @@ if __name__ == '__main__':
 
     # Store args in a global variable
     
-    ARGS = args
+    ARGS = vars(args)
 
     # Parse addresses
 
-    src = parse_address(ARGS.src)
-    dst = parse_address(ARGS.dst)
+    src = parse_address(ARGS['src'])
+    dst = parse_address(ARGS['dst'])
     
     # Store excluded directories in a global var
     
-    if ARGS.excl_dirs is not None :
-        EXCLUDED_DIRS = [ s for s in ARGS.excl_dirs.split(',') ]
+    if ARGS['excl_dirs'] is not None :
+        EXCLUDED_DIRS = [ s for s in ARGS['excl_dirs'].split(',') ]
     
     # Only one remote allowed.
 
@@ -1252,12 +1257,12 @@ if __name__ == '__main__':
 
     # Is this the server?
 
-    if ARGS.server and not ARGS.source :
+    if ARGS['server'] and not ARGS['source'] :
         init_io(sys.stdout, sys.stdin)
         run_dest_job(src, dst)
         sys.exit(0)
 
-    if ARGS.server and ARGS.source :
+    if ARGS['server'] and ARGS['source'] :
         init_io(sys.stdout, sys.stdin)
         run_src_job(src, dst)
         sys.exit(0)
@@ -1288,7 +1293,7 @@ if __name__ == '__main__':
         dstpath = os.path.normpath(join(dst['path'], subdir))
         if (dst['remote']):
             dstpath = dst['remote'] + ':' + dstpath
-        if os.getuid() == 0 and have_option('numeric-ids'):
+        if os.getuid() == 0 and have_option('numeric_ids'):
             rsync_cmd = 'rsync -av --numeric-ids --dry-run "%s" "%s"' % (srcpath, dstpath)
         else:
             rsync_cmd = 'rsync -av --dry-run "%s" "%s"' % (srcpath, dstpath)
